@@ -1,86 +1,129 @@
 const std = @import("std");
 const Package = @import("package.zig").Package;
-const Cache = @import("cache.zig");
+const Cache = @import("cache.zig").Cache;
+const ThreadPool = std.Thread.Pool;
+const Atomic = std.atomic.Atomic;
 
 pub const Fetcher = struct {
     allocator: std.mem.Allocator,
     cache: Cache,
+    pool: ThreadPool,
+    errors: std.ArrayListUnmanaged(ErrorInfo),
+    error_flag: Atomic(bool),
+
+    const ErrorInfo = struct {
+        pkg_name: []const u8,
+        err: anyerror,
+        message: []const u8,
+    };
 
     pub fn init(allocator: std.mem.Allocator) !Fetcher {
+        var pool = ThreadPool.init(.{ .allocator = allocator });
+        try pool.spawnWorkers(std.Thread.getCpuCount() catch 4);
+
         return .{
             .allocator = allocator,
             .cache = try Cache.init(allocator),
+            .pool = pool,
+            .errors = .{},
+            .error_flag = Atomic(bool).init(false),
         };
     }
 
     pub fn deinit(self: *Fetcher) void {
         self.cache.deinit();
+        self.pool.deinit();
+        
+        for (self.errors.items) |err| {
+            self.allocator.free(err.pkg_name);
+            self.allocator.free(err.message);
+        }
+        self.errors.deinit(self.allocator);
     }
 
-    pub fn fetch(self: *Fetcher, pkg: Package) !void {
-        const pkg_dir = try std.fs.path.join(self.allocator, &[_][]const u8{ "zel-packages", pkg.name });
-        defer self.allocator.free(pkg_dir);
+    pub fn fetchAll(self: *Fetcher, packages: []const Package) !void {
+        var context = Context{
+            .fetcher = self,
+            .packages = packages,
+        };
 
-        if (try self.cache.hasPackage(pkg.name, pkg.version)) {
+        // Schedule all downloads
+        for (packages, 0..) |pkg, i| {
+            try self.pool.spawn(fetchWorker, .{ &context, i });
+        }
+
+        // Wait for completion
+        self.pool.waitAndWork();
+
+        if (self.error_flag.load(.SeqCst)) {
+            return error.DownloadFailed;
+        }
+    }
+
+    const Context = struct {
+        fetcher: *Fetcher,
+        packages: []const Package,
+    };
+
+    fn fetchWorker(ctx: *Context, index: usize) void {
+        const pkg = ctx.packages[index];
+        const fetcher = ctx.fetcher;
+
+        if (fetcher.cache.hasPackage(pkg.name, pkg.version) catch false) {
             std.debug.print("Using cached {s}@{s}\n", .{ pkg.name, pkg.version });
             return;
         }
 
-        std.debug.print("Fetching {s}@{s}\n", .{ pkg.name, pkg.version });
+        std.debug.print("Downloading {s}@{s}\n", .{ pkg.name, pkg.version });
+
+        const pkg_dir = std.fmt.allocPrint(fetcher.allocator, "zel-packages/{s}", .{pkg.name}) catch {
+            fetcher.recordError(pkg.name, error.OutOfMemory, "Failed to allocate path") catch {};
+            return;
+        };
+        defer fetcher.allocator.free(pkg_dir);
 
         switch (pkg.source) {
             .git => |git| {
-                try self.fetchGit(git.url, git.rev, pkg_dir);
+                fetcher.fetchGit(pkg.name, git.url, git.rev, pkg_dir) catch |err| {
+                    fetcher.recordError(pkg.name, err, "Git download failed") catch {};
+                };
             },
             .http => |http| {
-                try self.fetchHttp(http.url, http.sha256, pkg_dir);
+                fetcher.fetchHttp(pkg.name, http.url, http.sha256, pkg_dir) catch |err| {
+                    fetcher.recordError(pkg.name, err, "HTTP download failed") catch {};
+                };
             },
             .local => |path| {
-                try self.fetchLocal(path, pkg_dir);
+                fetcher.fetchLocal(pkg.name, path, pkg_dir) catch |err| {
+                    fetcher.recordError(pkg.name, err, "Local package link failed") catch {};
+                };
             },
         }
 
-        try self.cache.addPackage(pkg.name, pkg.version, pkg_dir);
-    }
-
-    fn fetchGit(self: *Fetcher, url: []const u8, rev: []const u8, dest: []const u8) !void {
-        std.debug.print("Cloning {s} at {s}\n", .{ url, rev });
-
-        // Create temp dir
-        const tmp_dir = "tmp-git-clone";
-        defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-        // Clone repo
-        try utils.runCommand(&.{ "git", "clone", url, tmp_dir });
-
-        // Checkout specific revision if needed
-        if (!std.mem.eql(u8, rev, "HEAD")) {
-            try utils.runCommand(&.{ "git", "-C", tmp_dir, "checkout", rev });
+        if (!fetcher.error_flag.load(.SeqCst)) {
+            fetcher.cache.addPackage(pkg.name, pkg.version, pkg_dir) catch |err| {
+                fetcher.recordError(pkg.name, err, "Failed to cache package") catch {};
+            };
         }
-
-        // Move to destination
-        try std.fs.cwd().rename(tmp_dir, dest);
     }
 
-    fn fetchHttp(self: *Fetcher, url: []const u8, sha256: []const u8, dest: []const u8) !void {
-        _ = sha256; // TODO: Verify checksum
-        std.debug.print("Downloading {s}\n", .{url});
-
-        // Create temp file
-        const tmp_file = "tmp-download";
-        defer std.fs.cwd().deleteFile(tmp_file) catch {};
-
-        // Download file
-        try utils.runCommand(&.{ "curl", "-L", "-o", tmp_file, url });
-
-        // Extract archive
-        try std.fs.cwd().makeDir(dest);
-        try utils.runCommand(&.{ "tar", "-xzf", tmp_file, "-C", dest });
+    fn recordError(self: *Fetcher, pkg_name: []const u8, err: anyerror, message: []const u8) !void {
+        self.error_flag.store(true, .SeqCst);
+        
+        try self.errors.append(self.allocator, .{
+            .pkg_name = try self.allocator.dupe(u8, pkg_name),
+            .err = err,
+            .message = try self.allocator.dupe(u8, message),
+        });
     }
 
-    fn fetchLocal(self: *Fetcher, path: []const u8, dest: []const u8) !void {
-        std.debug.print("Linking local package {s}\n", .{path});
-
-        try std.fs.cwd().symLink(path, dest, .{ .is_directory = true });
+    pub fn formatErrors(self: *Fetcher, writer: anytype) !void {
+        for (self.errors.items) |err| {
+            try writer.print("{s}: {s} - {any}\n", .{
+                err.pkg_name,
+                err.message,
+                err.err,
+            });
+        }
     }
 };
